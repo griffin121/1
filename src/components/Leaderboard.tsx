@@ -1,4 +1,6 @@
 import { useEffect, useState } from 'react';
+import { polymarketService, PolymarketMatch } from '../lib/polymarketApi';
+import { buildOwnerLookup, normalizeTeamName } from '../lib/owners';
 
 interface TeamEntry {
   teamName: string;
@@ -93,6 +95,117 @@ function formatFixtureDate(iso: string): string {
   }
 }
 
+// Process matches into leaderboard data
+function processMatches(matches: PolymarketMatch[]): LeaderboardData {
+  const ownerLookup = buildOwnerLookup();
+  const leaderboardMap: Record<string, OwnerEntry> = {
+    Tim: { owner: 'Tim', totalPoints: 0, teams: [] },
+    James: { owner: 'James', totalPoints: 0, teams: [] },
+    Griffin: { owner: 'Griffin', totalPoints: 0, teams: [] }
+  };
+
+  const groupsMap: Record<string, GroupTeamRow[]> = {};
+  const recentResults: FixtureEntry[] = [];
+  const upcomingFixtures: FixtureEntry[] = [];
+
+  matches.forEach(match => {
+    const normalizedHome = normalizeTeamName(match.homeTeam);
+    const normalizedAway = normalizeTeamName(match.awayTeam);
+    const homeOwner = ownerLookup[normalizedHome];
+    const awayOwner = ownerLookup[normalizedAway];
+
+    const fixture: FixtureEntry = {
+      date: match.startTime,
+      round: match.round || 'Group Stage',
+      home: match.homeTeam,
+      away: match.awayTeam,
+      homeGoals: match.homeScore,
+      awayGoals: match.awayScore,
+      status: match.status
+    };
+
+    // Categorize fixtures
+    if (match.status === 'completed' || match.status === 'live') {
+      recentResults.push(fixture);
+    } else {
+      upcomingFixtures.push(fixture);
+    }
+
+    // Update group stage data if applicable
+    if (match.group) {
+      if (!groupsMap[match.group]) {
+        groupsMap[match.group] = [];
+      }
+
+      const homeTeamExists = groupsMap[match.group].some(t => t.teamName === match.homeTeam);
+      if (!homeTeamExists) {
+        groupsMap[match.group].push({
+          teamName: match.homeTeam,
+          rank: 0,
+          played: 0,
+          wins: 0,
+          draws: 0,
+          losses: 0,
+          goalsDiff: 0,
+          points: 0,
+          owner: homeOwner || null
+        });
+      }
+
+      const awayTeamExists = groupsMap[match.group].some(t => t.teamName === match.awayTeam);
+      if (!awayTeamExists) {
+        groupsMap[match.group].push({
+          teamName: match.awayTeam,
+          rank: 0,
+          played: 0,
+          wins: 0,
+          draws: 0,
+          losses: 0,
+          goalsDiff: 0,
+          points: 0,
+          owner: awayOwner || null
+        });
+      }
+    }
+
+    // Calculate points for owners
+    if (match.status === 'completed') {
+      let homePoints = 0;
+      let awayPoints = 0;
+
+      if (match.homeScore > match.awayScore) {
+        homePoints = 3;
+      } else if (match.awayScore > match.homeScore) {
+        awayPoints = 3;
+      } else {
+        homePoints = 1;
+        awayPoints = 1;
+      }
+
+      if (homeOwner && leaderboardMap[homeOwner]) {
+        leaderboardMap[homeOwner].totalPoints += homePoints;
+      }
+      if (awayOwner && leaderboardMap[awayOwner]) {
+        leaderboardMap[awayOwner].totalPoints += awayPoints;
+      }
+    }
+  });
+
+  const groups: GroupSummary[] = Object.entries(groupsMap).map(([groupName, teams]) => ({
+    groupName,
+    teams
+  }));
+
+  return {
+    updatedAt: new Date().toISOString(),
+    currentRound: 'Group Stage',
+    leaderboard: Object.values(leaderboardMap),
+    groups,
+    recentResults,
+    upcomingFixtures
+  };
+}
+
 export default function Leaderboard() {
   const [data, setData] = useState<LeaderboardData | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -101,15 +214,48 @@ export default function Leaderboard() {
     James: true,
     Griffin: true
   });
+  const [isConnected, setIsConnected] = useState(false);
 
   useEffect(() => {
-    fetch('data/leaderboard.json')
-      .then(res => {
-        if (!res.ok) throw new Error(`Failed to load data (${res.status})`);
-        return res.json();
+    // Try to connect to Polymarket WebSocket
+    polymarketService.connect()
+      .then(() => {
+        setIsConnected(true);
+        console.log('Connected to Polymarket WebSocket');
+        
+        // Listen for match updates
+        const unsubscribe = polymarketService.onMatchUpdate(() => {
+          const matches = polymarketService.getCurrentMatches();
+          const processedData = processMatches(Array.from(matches));
+          setData(processedData);
+        });
+
+        // Initial load of matches if any are already cached
+        const matches = polymarketService.getCurrentMatches();
+        if (matches.length > 0) {
+          const processedData = processMatches(matches);
+          setData(processedData);
+        }
+
+        return unsubscribe;
       })
-      .then(setData)
-      .catch(err => setLoadError(err.message));
+      .catch(err => {
+        console.error('Failed to connect to Polymarket:', err);
+        setLoadError(`WebSocket connection failed: ${err.message}. Attempting to load fallback data...`);
+        
+        // Fallback to static JSON
+        fetch('data/leaderboard.json')
+          .then(res => {
+            if (!res.ok) throw new Error(`Failed to load data (${res.status})`);
+            return res.json();
+          })
+          .then(setData)
+          .catch(fallbackErr => setLoadError(fallbackErr.message));
+      });
+
+    return () => {
+      polymarketService.disconnect();
+    };
   }, []);
 
   function toggleOwner(owner: string) {
@@ -119,14 +265,13 @@ export default function Leaderboard() {
   if (loadError) {
     return (
       <div className="error-banner">
-        Couldn&apos;t load leaderboard data: {loadError}. The hourly update job may not
-        have run yet.
+        {loadError}
       </div>
     );
   }
 
   if (!data) {
-    return <div className="empty-state">Loading scoreboard&hellip;</div>;
+    return <div className="empty-state">Loading scoreboard{isConnected ? ' from Polymarket' : ''}…</div>;
   }
 
   const sortedLeaderboard = [...data.leaderboard].sort((a, b) => {
@@ -139,6 +284,9 @@ export default function Leaderboard() {
       <div className="status-row">
         <span>
           Updated: <strong>{formatUpdatedAt(data.updatedAt)}</strong>
+        </span>
+        <span>
+          Status: <strong>{isConnected ? '🟢 Live' : '⚪ Cached'}</strong>
         </span>
         {data.currentRound && (
           <span>
