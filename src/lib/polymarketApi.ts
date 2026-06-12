@@ -34,15 +34,33 @@ export class PolymarketWebSocketService {
   private maxReconnectAttempts = 5;
   private currentMatches: Map<string, PolymarketMatch> = new Map();
   private subscriptionId: string | null = null;
+  private isConnecting = false;
 
   connect(): Promise<void> {
     return new Promise((resolve, reject) => {
+      if (this.isConnecting) {
+        console.log('Already connecting...');
+        return;
+      }
+
+      this.isConnecting = true;
+
       try {
+        console.log('Attempting to connect to Polymarket API:', this.url);
         this.ws = new WebSocket(this.url);
 
+        // Set a timeout for connection
+        const connectionTimeout = setTimeout(() => {
+          console.error('WebSocket connection timeout');
+          this.isConnecting = false;
+          reject(new Error('Connection timeout'));
+        }, 10000);
+
         this.ws.onopen = () => {
+          clearTimeout(connectionTimeout);
           console.log('Connected to Polymarket API');
           this.reconnectAttempts = 0;
+          this.isConnecting = false;
           this.subscribeToWorldCupMatches();
           resolve();
         };
@@ -50,29 +68,37 @@ export class PolymarketWebSocketService {
         this.ws.onmessage = (event) => {
           try {
             const message: PolymarketMessage = JSON.parse(event.data);
+            console.log('Received message:', message);
             this.handleMessage(message);
             this.messageHandlers.forEach(handler => handler(message));
           } catch (error) {
-            console.error('Failed to parse WebSocket message:', error);
+            console.error('Failed to parse WebSocket message:', error, event.data);
           }
         };
 
         this.ws.onerror = (error) => {
           console.error('WebSocket error:', error);
+          clearTimeout(connectionTimeout);
+          this.isConnecting = false;
           reject(error);
         };
 
         this.ws.onclose = () => {
           console.log('Disconnected from Polymarket API');
+          clearTimeout(connectionTimeout);
+          this.isConnecting = false;
           this.attemptReconnect();
         };
       } catch (error) {
+        console.error('Error creating WebSocket:', error);
+        this.isConnecting = false;
         reject(error);
       }
     });
   }
 
   private subscribeToWorldCupMatches(): void {
+    console.log('Subscribing to World Cup matches');
     // Subscribe to World Cup 2026 matches
     const subscription = {
       type: 'subscribe',
@@ -161,13 +187,14 @@ export class PolymarketWebSocketService {
     }
     this.currentMatches.clear();
     this.subscriptionId = null;
+    this.isConnecting = false;
   }
 
   private attemptReconnect(): void {
     if (this.reconnectAttempts < this.maxReconnectAttempts) {
       this.reconnectAttempts++;
       const delay = Math.pow(2, this.reconnectAttempts) * 1000;
-      console.log(`Attempting to reconnect in ${delay}ms...`);
+      console.log(`Attempting to reconnect in ${delay}ms... (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
       setTimeout(() => this.connect().catch(err => console.error('Reconnection failed:', err)), delay);
     } else {
       console.error('Max reconnection attempts reached');
@@ -178,7 +205,7 @@ export class PolymarketWebSocketService {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(message));
     } else {
-      console.warn('WebSocket is not connected');
+      console.warn('WebSocket is not connected, state:', this.ws?.readyState);
     }
   }
 }
