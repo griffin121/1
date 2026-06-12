@@ -217,43 +217,71 @@ export default function Leaderboard() {
   const [isConnected, setIsConnected] = useState(false);
 
   useEffect(() => {
-    // Try to connect to Polymarket WebSocket
+    let unsubscribeMatch: (() => void) | null = null;
+    let wsTimeoutId: NodeJS.Timeout | null = null;
+
+    // Load static JSON immediately
+    const loadStaticData = () => {
+      console.log('Loading static leaderboard data...');
+      fetch('data/leaderboard.json')
+        .then(res => {
+          if (!res.ok) throw new Error(`Failed to load data (${res.status})`);
+          return res.json();
+        })
+        .then(staticData => {
+          console.log('Static data loaded successfully');
+          setData(staticData);
+          setLoadError(null);
+        })
+        .catch(err => {
+          console.error('Failed to load static data:', err);
+          setLoadError(`Could not load leaderboard data: ${err.message}`);
+        });
+    };
+
+    // Load static data first
+    loadStaticData();
+
+    // Try to connect to Polymarket WebSocket with timeout
+    wsTimeoutId = setTimeout(() => {
+      console.log('WebSocket connection attempt timeout, skipping');
+      setIsConnected(false);
+    }, 5000);
+
     polymarketService.connect()
       .then(() => {
-        setIsConnected(true);
+        if (wsTimeoutId) clearTimeout(wsTimeoutId);
         console.log('Connected to Polymarket WebSocket');
+        setIsConnected(true);
         
         // Listen for match updates
-        const unsubscribe = polymarketService.onMatchUpdate(() => {
+        unsubscribeMatch = polymarketService.onMatchUpdate(() => {
+          console.log('Match update received');
           const matches = polymarketService.getCurrentMatches();
-          const processedData = processMatches(Array.from(matches));
-          setData(processedData);
+          if (matches.length > 0) {
+            const processedData = processMatches(Array.from(matches));
+            setData(processedData);
+          }
         });
 
         // Initial load of matches if any are already cached
         const matches = polymarketService.getCurrentMatches();
         if (matches.length > 0) {
+          console.log('Processing cached matches:', matches.length);
           const processedData = processMatches(matches);
           setData(processedData);
         }
-
-        return unsubscribe;
       })
       .catch(err => {
+        if (wsTimeoutId) clearTimeout(wsTimeoutId);
         console.error('Failed to connect to Polymarket:', err);
-        setLoadError(`WebSocket connection failed: ${err.message}. Attempting to load fallback data...`);
-        
-        // Fallback to static JSON
-        fetch('data/leaderboard.json')
-          .then(res => {
-            if (!res.ok) throw new Error(`Failed to load data (${res.status})`);
-            return res.json();
-          })
-          .then(setData)
-          .catch(fallbackErr => setLoadError(fallbackErr.message));
+        setIsConnected(false);
+        // Data already loaded from static JSON
       });
 
     return () => {
+      if (unsubscribeMatch) unsubscribeMatch();
+      if (wsTimeoutId) clearTimeout(wsTimeoutId);
       polymarketService.disconnect();
     };
   }, []);
@@ -271,7 +299,7 @@ export default function Leaderboard() {
   }
 
   if (!data) {
-    return <div className="empty-state">Loading scoreboard{isConnected ? ' from Polymarket' : ''}…</div>;
+    return <div className="empty-state">Loading scoreboard…</div>;
   }
 
   const sortedLeaderboard = [...data.leaderboard].sort((a, b) => {
