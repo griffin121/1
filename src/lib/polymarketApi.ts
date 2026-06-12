@@ -1,15 +1,39 @@
+import { buildOwnerLookup } from './owners';
+
+export interface PolymarketMatch {
+  id: string;
+  homeTeam: string;
+  awayTeam: string;
+  homeScore: number;
+  awayScore: number;
+  status: string;
+  startTime: string;
+  round: string;
+  group?: string;
+}
+
 export interface PolymarketMessage {
-  // Adjust these based on actual Polymarket API response structure
   type: string;
   data?: any;
+}
+
+interface MatchUpdate {
+  matchId: string;
+  homeScore: number;
+  awayScore: number;
+  status: string;
+  timestamp: string;
 }
 
 export class PolymarketWebSocketService {
   private ws: WebSocket | null = null;
   private url = 'wss://sports-api.polymarket.com/ws';
   private messageHandlers: ((message: PolymarketMessage) => void)[] = [];
+  private matchUpdateHandlers: ((update: MatchUpdate) => void)[] = [];
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 5;
+  private currentMatches: Map<string, PolymarketMatch> = new Map();
+  private subscriptionId: string | null = null;
 
   connect(): Promise<void> {
     return new Promise((resolve, reject) => {
@@ -19,12 +43,14 @@ export class PolymarketWebSocketService {
         this.ws.onopen = () => {
           console.log('Connected to Polymarket API');
           this.reconnectAttempts = 0;
+          this.subscribeToWorldCupMatches();
           resolve();
         };
 
         this.ws.onmessage = (event) => {
           try {
             const message: PolymarketMessage = JSON.parse(event.data);
+            this.handleMessage(message);
             this.messageHandlers.forEach(handler => handler(message));
           } catch (error) {
             console.error('Failed to parse WebSocket message:', error);
@@ -46,6 +72,64 @@ export class PolymarketWebSocketService {
     });
   }
 
+  private subscribeToWorldCupMatches(): void {
+    // Subscribe to World Cup 2026 matches
+    const subscription = {
+      type: 'subscribe',
+      channel: 'matches',
+      filters: {
+        tournament: 'fifa_world_cup_2026',
+        active: true
+      }
+    };
+    this.send(subscription);
+  }
+
+  private handleMessage(message: PolymarketMessage): void {
+    if (message.type === 'match_update' && message.data) {
+      const matchData = message.data;
+      const matchId = matchData.id || `${matchData.homeTeam}-${matchData.awayTeam}`;
+      
+      const match: PolymarketMatch = {
+        id: matchId,
+        homeTeam: matchData.homeTeam,
+        awayTeam: matchData.awayTeam,
+        homeScore: matchData.homeScore || 0,
+        awayScore: matchData.awayScore || 0,
+        status: matchData.status || 'scheduled',
+        startTime: matchData.startTime,
+        round: matchData.round,
+        group: matchData.group
+      };
+
+      const previousMatch = this.currentMatches.get(matchId);
+      this.currentMatches.set(matchId, match);
+
+      // Notify handlers of match updates
+      if (previousMatch && 
+          (previousMatch.homeScore !== match.homeScore || 
+           previousMatch.awayScore !== match.awayScore ||
+           previousMatch.status !== match.status)) {
+        
+        const update: MatchUpdate = {
+          matchId,
+          homeScore: match.homeScore,
+          awayScore: match.awayScore,
+          status: match.status,
+          timestamp: new Date().toISOString()
+        };
+        
+        this.matchUpdateHandlers.forEach(handler => handler(update));
+        console.log('Match updated:', match);
+      }
+    }
+
+    if (message.type === 'subscription_confirmed') {
+      this.subscriptionId = message.data?.subscriptionId;
+      console.log('Subscribed to World Cup matches:', this.subscriptionId);
+    }
+  }
+
   subscribe(handler: (message: PolymarketMessage) => void): void {
     this.messageHandlers.push(handler);
   }
@@ -54,11 +138,29 @@ export class PolymarketWebSocketService {
     this.messageHandlers = this.messageHandlers.filter(h => h !== handler);
   }
 
+  onMatchUpdate(handler: (update: MatchUpdate) => void): () => void {
+    this.matchUpdateHandlers.push(handler);
+    // Return unsubscribe function
+    return () => {
+      this.matchUpdateHandlers = this.matchUpdateHandlers.filter(h => h !== handler);
+    };
+  }
+
+  getCurrentMatches(): PolymarketMatch[] {
+    return Array.from(this.currentMatches.values());
+  }
+
+  getMatchById(matchId: string): PolymarketMatch | undefined {
+    return this.currentMatches.get(matchId);
+  }
+
   disconnect(): void {
     if (this.ws) {
       this.ws.close();
       this.ws = null;
     }
+    this.currentMatches.clear();
+    this.subscriptionId = null;
   }
 
   private attemptReconnect(): void {
@@ -66,13 +168,17 @@ export class PolymarketWebSocketService {
       this.reconnectAttempts++;
       const delay = Math.pow(2, this.reconnectAttempts) * 1000;
       console.log(`Attempting to reconnect in ${delay}ms...`);
-      setTimeout(() => this.connect(), delay);
+      setTimeout(() => this.connect().catch(err => console.error('Reconnection failed:', err)), delay);
+    } else {
+      console.error('Max reconnection attempts reached');
     }
   }
 
   send(message: any): void {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(message));
+    } else {
+      console.warn('WebSocket is not connected');
     }
   }
 }
